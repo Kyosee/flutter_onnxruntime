@@ -107,35 +107,70 @@ if(NOT USE_SYSTEM_ONNXRUNTIME)
 
   # Create a directory for the downloaded library
   set(ONNXRUNTIME_DOWNLOAD_DIR "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime")
-
-  # Download and extract ONNX Runtime - using file(DOWNLOAD) for more direct control
-  if(NOT
-     EXISTS
-     "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime-linux-${ONNXRUNTIME_ARCH}-${ONNXRUNTIME_VERSION}/include/onnxruntime_cxx_api.h"
-  )
-    message(STATUS "Downloading ONNX Runtime...")
-    file(MAKE_DIRECTORY ${ONNXRUNTIME_DOWNLOAD_DIR})
-
-    # Download the tarball
-    set(ONNXRUNTIME_TARBALL "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime.tgz")
-    file(DOWNLOAD ${ONNXRUNTIME_URL} ${ONNXRUNTIME_TARBALL} SHOW_PROGRESS)
-
-    # Extract the tarball
-    message(STATUS "Extracting ONNX Runtime...")
-    execute_process(COMMAND ${CMAKE_COMMAND} -E tar xzf ${ONNXRUNTIME_TARBALL}
-                    WORKING_DIRECTORY ${ONNXRUNTIME_DOWNLOAD_DIR})
-
-    # Clean up the tarball
-    file(REMOVE ${ONNXRUNTIME_TARBALL})
-  endif()
-
-  # Set paths to the extracted files
   set(ONNXRUNTIME_EXTRACT_DIR
       "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime-linux-${ONNXRUNTIME_ARCH}-${ONNXRUNTIME_VERSION}")
 
-  # Verify the directory exists
-  if(NOT EXISTS ${ONNXRUNTIME_EXTRACT_DIR})
-    message(FATAL_ERROR "ONNX Runtime extraction directory doesn't exist: ${ONNXRUNTIME_EXTRACT_DIR}")
+  # A partial extraction must not count as a usable cache.
+  if(NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/include/onnxruntime_cxx_api.h"
+     OR (NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so"
+         AND NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so.1"))
+    message(STATUS "Downloading ONNX Runtime...")
+    file(REMOVE_RECURSE "${ONNXRUNTIME_EXTRACT_DIR}")
+    file(MAKE_DIRECTORY "${ONNXRUNTIME_DOWNLOAD_DIR}")
+
+    # Download the tarball
+    set(ONNXRUNTIME_TARBALL "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime.tgz")
+    file(DOWNLOAD "${ONNXRUNTIME_URL}" "${ONNXRUNTIME_TARBALL}"
+         SHOW_PROGRESS STATUS ONNXRUNTIME_DOWNLOAD_STATUS TIMEOUT 120 TLS_VERIFY ON)
+    list(GET ONNXRUNTIME_DOWNLOAD_STATUS 0 ONNXRUNTIME_DOWNLOAD_CODE)
+
+    if(ONNXRUNTIME_DOWNLOAD_CODE EQUAL 0)
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E tar xzf "${ONNXRUNTIME_TARBALL}"
+                      WORKING_DIRECTORY "${ONNXRUNTIME_DOWNLOAD_DIR}"
+                      RESULT_VARIABLE ONNXRUNTIME_EXTRACT_RESULT
+                      ERROR_VARIABLE ONNXRUNTIME_EXTRACT_ERROR)
+    else()
+      # Microsoft also publishes the same CPU runtime and headers on NuGet.
+      message(STATUS "GitHub ONNX Runtime download failed (${ONNXRUNTIME_DOWNLOAD_STATUS}); trying NuGet")
+      set(ONNXRUNTIME_NUGET_URL
+          "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ONNXRUNTIME_VERSION}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg")
+      set(ONNXRUNTIME_NUGET_PACKAGE "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime.nupkg")
+      set(ONNXRUNTIME_NUGET_DIR "${ONNXRUNTIME_DOWNLOAD_DIR}/nuget")
+      file(DOWNLOAD "${ONNXRUNTIME_NUGET_URL}" "${ONNXRUNTIME_NUGET_PACKAGE}"
+           SHOW_PROGRESS STATUS ONNXRUNTIME_DOWNLOAD_STATUS TIMEOUT 600 TLS_VERIFY ON)
+      list(GET ONNXRUNTIME_DOWNLOAD_STATUS 0 ONNXRUNTIME_DOWNLOAD_CODE)
+      if(NOT ONNXRUNTIME_DOWNLOAD_CODE EQUAL 0)
+        message(FATAL_ERROR "Failed to download ONNX Runtime from ${ONNXRUNTIME_NUGET_URL}: ${ONNXRUNTIME_DOWNLOAD_STATUS}")
+      endif()
+
+      file(REMOVE_RECURSE "${ONNXRUNTIME_NUGET_DIR}")
+      file(MAKE_DIRECTORY "${ONNXRUNTIME_NUGET_DIR}")
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E tar xf "${ONNXRUNTIME_NUGET_PACKAGE}"
+                      WORKING_DIRECTORY "${ONNXRUNTIME_NUGET_DIR}"
+                      RESULT_VARIABLE ONNXRUNTIME_EXTRACT_RESULT
+                      ERROR_VARIABLE ONNXRUNTIME_EXTRACT_ERROR)
+      if(ONNXRUNTIME_EXTRACT_RESULT STREQUAL "0")
+        set(ONNXRUNTIME_NUGET_ARCH "${ONNXRUNTIME_ARCH}")
+        if(ONNXRUNTIME_ARCH STREQUAL "aarch64")
+          set(ONNXRUNTIME_NUGET_ARCH "arm64")
+        endif()
+        file(COPY "${ONNXRUNTIME_NUGET_DIR}/build/native/include" DESTINATION "${ONNXRUNTIME_EXTRACT_DIR}")
+        # The NuGet file is unversioned, but its ELF SONAME is libonnxruntime.so.1.
+        configure_file("${ONNXRUNTIME_NUGET_DIR}/runtimes/linux-${ONNXRUNTIME_NUGET_ARCH}/native/libonnxruntime.so"
+                       "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so.1" COPYONLY)
+      endif()
+      file(REMOVE "${ONNXRUNTIME_NUGET_PACKAGE}")
+      file(REMOVE_RECURSE "${ONNXRUNTIME_NUGET_DIR}")
+    endif()
+
+    file(REMOVE "${ONNXRUNTIME_TARBALL}")
+    if(NOT ONNXRUNTIME_EXTRACT_RESULT STREQUAL "0")
+      message(FATAL_ERROR "Failed to extract ONNX Runtime: ${ONNXRUNTIME_EXTRACT_ERROR}")
+    endif()
+  endif()
+
+  if(NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/include/onnxruntime_cxx_api.h")
+    message(FATAL_ERROR "ONNX Runtime header missing: ${ONNXRUNTIME_EXTRACT_DIR}/include/onnxruntime_cxx_api.h")
   endif()
 
   # Set include and library directories
@@ -151,6 +186,8 @@ if(NOT USE_SYSTEM_ONNXRUNTIME)
   # Find the library files
   if(EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so")
     set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so")
+  elseif(EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so.1")
+    set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME_EXTRACT_DIR}/lib/libonnxruntime.so.1")
   else()
     # Try to find the library in case the structure changed
     file(GLOB_RECURSE ONNXRUNTIME_LIB_CANDIDATES
