@@ -84,35 +84,66 @@ if(NOT USE_SYSTEM_ONNXRUNTIME)
 
   # Create a directory for the downloaded library
   set(ONNXRUNTIME_DOWNLOAD_DIR "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime")
-
-  # Download and extract ONNX Runtime - using file(DOWNLOAD) for more direct control
-  if(NOT
-     EXISTS
-     "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime-win-${ONNXRUNTIME_ARCH}-${ONNXRUNTIME_VERSION}/include/onnxruntime_cxx_api.h"
-  )
-    message(STATUS "Downloading ONNX Runtime...")
-    file(MAKE_DIRECTORY ${ONNXRUNTIME_DOWNLOAD_DIR})
-
-    # Download the zipfile
-    set(ONNXRUNTIME_ZIPFILE "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime.zip")
-    file(DOWNLOAD ${ONNXRUNTIME_URL} ${ONNXRUNTIME_ZIPFILE} SHOW_PROGRESS)
-
-    # Extract the zipfile
-    message(STATUS "Extracting ONNX Runtime...")
-    execute_process(COMMAND ${CMAKE_COMMAND} -E tar xf ${ONNXRUNTIME_ZIPFILE}
-                    WORKING_DIRECTORY ${ONNXRUNTIME_DOWNLOAD_DIR})
-
-    # Clean up the zipfile
-    file(REMOVE ${ONNXRUNTIME_ZIPFILE})
-  endif()
-
-  # Set paths to the extracted files
   set(ONNXRUNTIME_EXTRACT_DIR "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime-win-${ONNXRUNTIME_ARCH}-${ONNXRUNTIME_VERSION}")
 
-  # Verify the directory exists
-  if(NOT EXISTS ${ONNXRUNTIME_EXTRACT_DIR})
-    message(FATAL_ERROR "ONNX Runtime extraction directory doesn't exist: ${ONNXRUNTIME_EXTRACT_DIR}")
+  # A header-only cache cannot build or run the Windows plugin.
+  if(NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/include/onnxruntime_cxx_api.h"
+     OR NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.lib"
+     OR NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.dll")
+    message(STATUS "Downloading ONNX Runtime...")
+    file(REMOVE_RECURSE "${ONNXRUNTIME_EXTRACT_DIR}")
+    file(MAKE_DIRECTORY "${ONNXRUNTIME_DOWNLOAD_DIR}")
+
+    set(ONNXRUNTIME_ZIPFILE "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime.zip")
+    file(DOWNLOAD "${ONNXRUNTIME_URL}" "${ONNXRUNTIME_ZIPFILE}"
+         SHOW_PROGRESS STATUS ONNXRUNTIME_DOWNLOAD_STATUS TIMEOUT 120 TLS_VERIFY ON)
+    list(GET ONNXRUNTIME_DOWNLOAD_STATUS 0 ONNXRUNTIME_DOWNLOAD_CODE)
+
+    if(ONNXRUNTIME_DOWNLOAD_CODE EQUAL 0)
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E tar xf "${ONNXRUNTIME_ZIPFILE}"
+                      WORKING_DIRECTORY "${ONNXRUNTIME_DOWNLOAD_DIR}"
+                      RESULT_VARIABLE ONNXRUNTIME_EXTRACT_RESULT
+                      ERROR_VARIABLE ONNXRUNTIME_EXTRACT_ERROR)
+    else()
+      # Microsoft publishes the same CPU runtime and headers on NuGet.
+      message(STATUS "GitHub ONNX Runtime download failed (${ONNXRUNTIME_DOWNLOAD_STATUS}); trying NuGet")
+      set(ONNXRUNTIME_NUGET_URL
+          "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ONNXRUNTIME_VERSION}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg")
+      set(ONNXRUNTIME_NUGET_PACKAGE "${ONNXRUNTIME_DOWNLOAD_DIR}/onnxruntime.nupkg")
+      set(ONNXRUNTIME_NUGET_DIR "${ONNXRUNTIME_DOWNLOAD_DIR}/nuget")
+      file(DOWNLOAD "${ONNXRUNTIME_NUGET_URL}" "${ONNXRUNTIME_NUGET_PACKAGE}"
+           SHOW_PROGRESS STATUS ONNXRUNTIME_DOWNLOAD_STATUS TIMEOUT 600 TLS_VERIFY ON)
+      list(GET ONNXRUNTIME_DOWNLOAD_STATUS 0 ONNXRUNTIME_DOWNLOAD_CODE)
+      if(NOT ONNXRUNTIME_DOWNLOAD_CODE EQUAL 0)
+        message(FATAL_ERROR "Failed to download ONNX Runtime from ${ONNXRUNTIME_NUGET_URL}: ${ONNXRUNTIME_DOWNLOAD_STATUS}")
+      endif()
+
+      file(REMOVE_RECURSE "${ONNXRUNTIME_NUGET_DIR}")
+      file(MAKE_DIRECTORY "${ONNXRUNTIME_NUGET_DIR}")
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E tar xf "${ONNXRUNTIME_NUGET_PACKAGE}"
+                      WORKING_DIRECTORY "${ONNXRUNTIME_NUGET_DIR}"
+                      RESULT_VARIABLE ONNXRUNTIME_EXTRACT_RESULT
+                      ERROR_VARIABLE ONNXRUNTIME_EXTRACT_ERROR)
+      if(ONNXRUNTIME_EXTRACT_RESULT STREQUAL "0")
+        file(COPY "${ONNXRUNTIME_NUGET_DIR}/build/native/include" DESTINATION "${ONNXRUNTIME_EXTRACT_DIR}")
+        file(COPY "${ONNXRUNTIME_NUGET_DIR}/runtimes/win-${ONNXRUNTIME_ARCH}/native/"
+             DESTINATION "${ONNXRUNTIME_EXTRACT_DIR}/lib")
+      endif()
+      file(REMOVE "${ONNXRUNTIME_NUGET_PACKAGE}")
+      file(REMOVE_RECURSE "${ONNXRUNTIME_NUGET_DIR}")
+    endif()
+
+    file(REMOVE "${ONNXRUNTIME_ZIPFILE}")
+    if(NOT ONNXRUNTIME_EXTRACT_RESULT STREQUAL "0")
+      message(FATAL_ERROR "Failed to extract ONNX Runtime: ${ONNXRUNTIME_EXTRACT_ERROR}")
+    endif()
   endif()
+
+  foreach(REQUIRED_FILE include/onnxruntime_cxx_api.h lib/onnxruntime.lib lib/onnxruntime.dll)
+    if(NOT EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/${REQUIRED_FILE}")
+      message(FATAL_ERROR "ONNX Runtime file missing: ${ONNXRUNTIME_EXTRACT_DIR}/${REQUIRED_FILE}")
+    endif()
+  endforeach()
 
   # Set include and library directories
   set(ONNXRUNTIME_INCLUDE_DIRS "${ONNXRUNTIME_EXTRACT_DIR}/include")
@@ -125,32 +156,14 @@ if(NOT USE_SYSTEM_ONNXRUNTIME)
   endforeach()
 
   # Find the library files (.dll and .lib)
-  if(EXISTS "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.lib")
-    set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.lib")
-    set(ONNXRUNTIME_DLL "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.dll")
-  else()
-    # Try to find the library in case the structure changed
-    file(GLOB_RECURSE ONNXRUNTIME_LIB_CANDIDATES "${ONNXRUNTIME_EXTRACT_DIR}/*onnxruntime*.lib")
-
-    if(ONNXRUNTIME_LIB_CANDIDATES)
-      list(GET ONNXRUNTIME_LIB_CANDIDATES 0 ONNXRUNTIME_LIBRARY)
-      # Find the corresponding DLL
-      get_filename_component(LIB_PATH ${ONNXRUNTIME_LIBRARY} DIRECTORY)
-      file(GLOB ONNXRUNTIME_DLL_CANDIDATES "${LIB_PATH}/*onnxruntime*.dll")
-      if(ONNXRUNTIME_DLL_CANDIDATES)
-        list(GET ONNXRUNTIME_DLL_CANDIDATES 0 ONNXRUNTIME_DLL)
-      endif()
-      message(STATUS "Found ONNX Runtime library: ${ONNXRUNTIME_LIBRARY}")
-      message(STATUS "Found ONNX Runtime DLL: ${ONNXRUNTIME_DLL}")
-    else()
-      message(FATAL_ERROR "Could not find ONNX Runtime library in extracted files")
-    endif()
-  endif()
-
+  set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.lib")
+  set(ONNXRUNTIME_DLL "${ONNXRUNTIME_EXTRACT_DIR}/lib/onnxruntime.dll")
   set(ONNXRUNTIME_LIBRARIES ${ONNXRUNTIME_LIBRARY})
 
-  # Add to bundled libraries for distribution
-  set(flutter_onnxruntime_bundled_libraries ${ONNXRUNTIME_DLL})
+  # Include companion runtime DLLs when the official package supplies them.
+  get_filename_component(ONNXRUNTIME_LIBRARY_DIR "${ONNXRUNTIME_DLL}" DIRECTORY)
+  file(GLOB ONNXRUNTIME_DLLS "${ONNXRUNTIME_LIBRARY_DIR}/*.dll")
+  set(flutter_onnxruntime_bundled_libraries ${ONNXRUNTIME_DLLS})
 endif()
 
 # Define Windows-specific preprocessor macros
@@ -222,13 +235,14 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE ${ONNXRUNTIME_LIBRARIES})
 # Link against Windows Shell API library for PathRemoveFileSpecW
 target_link_libraries(${PLUGIN_NAME} PRIVATE Shlwapi)
 
-# Copy over ONNX Runtime DLL to the build directory
+# Copy the runtime and companion DLLs to the build directory.
 if(NOT USE_SYSTEM_ONNXRUNTIME AND ONNXRUNTIME_DLL)
   add_custom_command(
     TARGET ${PLUGIN_NAME}
     POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ONNXRUNTIME_DLL} $<TARGET_FILE_DIR:${PLUGIN_NAME}>
-    COMMENT "Copying ONNX Runtime DLL to build directory")
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${ONNXRUNTIME_DLLS} "$<TARGET_FILE_DIR:${PLUGIN_NAME}>"
+    COMMENT "Copying ONNX Runtime DLLs to build directory"
+    VERBATIM)
 endif()
 
 # List of absolute paths to libraries that should be bundled with the plugin. This list could contain prebuilt
