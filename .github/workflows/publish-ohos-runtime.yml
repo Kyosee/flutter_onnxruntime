@@ -1,0 +1,98 @@
+name: Publish HarmonyOS ONNX Runtime
+
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-ohos-runtime
+  cancel-in-progress: false
+
+# For a new build, change the source pins and choose a new release tag.
+env:
+  RELEASE_TAG: ohos-onnxruntime-1.22.0-r1
+  ARCHIVE: onnxruntime-ohos-arm64-v8a.tar.gz
+  SOURCE_REPO: Kyosee/VeneraX
+  SOURCE_TAG: mobile-3.0.2-beta.2
+  SOURCE_COMMIT: a3d12cb7b05c64b1d0ae8c56e8652e6bc7a945a2
+  SOURCE_HAP: VeneraX-3.0.2-beta.2+262-harmonyos-unsigned.hap
+  HAP_SHA256: f832e04c9b05407f86629dd8fa63224fa7b978ac818c7d0cd4628103e67c8750
+  HUAWEI_TOOLS: '26.0.0.865'
+  INPUT_KEY: ohos-onnx-linux-26.0.0.865-arm64-v8a-e96bbb0b6961c8b1f609805bae690538ca973945-85032bfebf11e1f3d7f6252bdf8c01f3f1b9277f
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify the source and package its ARM64 library and notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$SOURCE_REPO/commits/refs/tags/$SOURCE_TAG" --jq .sha)" = "$SOURCE_COMMIT"
+          gh release download "$SOURCE_TAG" --repo "$SOURCE_REPO" --pattern "$SOURCE_HAP" --output source.hap
+          printf '%s  source.hap\n' "$HAP_SHA256" | sha256sum --check
+
+          library=libs/arm64-v8a/libonnxruntime.so
+          notices=resources/rawfile/onnxruntime
+          files=("$library" "src/main/$notices/LICENSE" "src/main/$notices/ThirdPartyNotices.txt")
+          mkdir -p "$(dirname "$library")" "src/main/$notices"
+          for file in "${files[@]}"; do
+            unzip -p source.hap "${file#src/main/}" > "$file"
+            test -s "$file"
+          done
+          tar --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner --mode=0644 \
+            -cf - "${files[@]}" | gzip -n -9 > "$ARCHIVE"
+
+          {
+            printf 'HarmonyOS ARM64 runtime from [VeneraX %s](https://github.com/%s/releases/tag/%s).\n\n' "$SOURCE_TAG" "$SOURCE_REPO" "$SOURCE_TAG"
+            printf -- '- Source HAP: `%s`\n- Source commit: `%s`\n' "$SOURCE_HAP" "$SOURCE_COMMIT"
+            printf -- '- Huawei toolchain: `%s`\n- Native build input key: `%s`\n\n' "$HUAWEI_TOOLS" "$INPUT_KEY"
+            printf 'SHA-256 digests:\n\n```text\n'
+            printf '%s  %s\n' "$HAP_SHA256" "$SOURCE_HAP"
+            sha256sum "$ARCHIVE" "${files[@]}"
+            printf '```\n'
+          } > release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the archive without replacing an existing asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="repos/$GITHUB_REPOSITORY"
+          ref=$(gh api "$api/git/matching-refs/tags/$RELEASE_TAG" --jq ".[] | select(.ref == \"refs/tags/$RELEASE_TAG\") | .ref")
+          if [[ -z "$ref" ]]; then
+            gh api --method POST "$api/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" --silent
+          fi
+          test "$(gh api "$api/commits/refs/tags/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
+
+          find_release() {
+            gh api --paginate "$api/releases?per_page=100" --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id"
+          }
+          id=$(find_release)
+          if [[ -z "$id" ]]; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "$RELEASE_TAG" --latest=false --notes-file release-notes.md
+            id=$(find_release)
+          fi
+          [[ "$id" =~ ^[0-9]+$ ]]
+          gh api "$api/releases/$id" > release.json
+          if jq -e '.draft and (.assets | length == 0)' release.json >/dev/null; then
+            gh release upload "$RELEASE_TAG" "$ARCHIVE" --repo "$GITHUB_REPOSITORY"
+          fi
+          digest="sha256:$(sha256sum "$ARCHIVE" | cut -d" " -f1)"
+          gh api "$api/releases/$id" > release.json
+          jq -e --arg name "$ARCHIVE" --arg digest "$digest" --argjson size "$(stat -c %s "$ARCHIVE")" \
+            --rawfile notes release-notes.md '
+              (.body | sub("\\n+$"; "")) == ($notes | sub("\\n+$"; "")) and
+              (.assets | length == 1) and
+              (.assets[0] | .name == $name and .state == "uploaded" and .digest == $digest and .size == $size)
+            ' release.json >/dev/null
+          if jq -e .draft release.json >/dev/null; then
+            gh api --method PATCH "$api/releases/$id" -F draft=false -f make_latest=false --silent
+          fi
+          gh api "$api/releases/$id" --jq 'select(.draft == false and .published_at != null) | .html_url' | grep -F "/$RELEASE_TAG"
