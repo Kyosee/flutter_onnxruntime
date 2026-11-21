@@ -64,25 +64,21 @@ jobs:
         run: |
           set -euo pipefail
           api="repos/$GITHUB_REPOSITORY"
-          ref=$(gh api "$api/git/matching-refs/tags/$RELEASE_TAG" --jq ".[] | select(.ref == \"refs/tags/$RELEASE_TAG\") | .ref")
-          if [[ -z "$ref" ]]; then
-            gh api --method POST "$api/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" --silent
-          fi
-          test "$(gh api "$api/commits/refs/tags/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
-
-          find_release() {
-            gh api --paginate "$api/releases?per_page=100" --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id"
-          }
-          id=$(find_release)
+          id=$(gh api --paginate "$api/releases?per_page=100" --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id")
           if [[ -z "$id" ]]; then
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-              --title "$RELEASE_TAG" --latest=false --notes-file release-notes.md
-            id=$(find_release)
+            ref=$(gh api "$api/git/matching-refs/tags/$RELEASE_TAG" --jq ".[] | select(.ref == \"refs/tags/$RELEASE_TAG\") | .ref")
+            if [[ -z "$ref" ]]; then
+              gh api --method POST "$api/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" --silent
+            fi
+            test "$(gh api "$api/commits/refs/tags/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
+            id=$(gh api --method POST "$api/releases" -f tag_name="$RELEASE_TAG" -f name="$RELEASE_TAG" \
+              -f target_commitish="$GITHUB_SHA" -F body=@release-notes.md -F draft=true -f make_latest=false --jq .id)
           fi
           [[ "$id" =~ ^[0-9]+$ ]]
           gh api "$api/releases/$id" > release.json
           if jq -e '.draft and (.assets | length == 0)' release.json >/dev/null; then
-            gh release upload "$RELEASE_TAG" "$ARCHIVE" --repo "$GITHUB_REPOSITORY"
+            upload_url=$(jq -r '.upload_url | split("{")[0]' release.json)
+            gh api --method POST "$upload_url?name=$ARCHIVE" -H 'Content-Type: application/gzip' --input "$ARCHIVE" --silent
           fi
           digest="sha256:$(sha256sum "$ARCHIVE" | cut -d" " -f1)"
           gh api "$api/releases/$id" > release.json
