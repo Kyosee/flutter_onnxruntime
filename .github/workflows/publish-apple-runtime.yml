@@ -1,0 +1,115 @@
+name: Publish Apple ONNX archives
+
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-apple-runtime
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: apple-onnxruntime-1.23.0-extensions-0.13.0-r1
+  SOURCE_COMMIT: 57f28b1fdd6fe33585370b146a46c597d6750953
+  RUNTIME: onnxruntime-libs-1.23.0.zip
+  EXTENSIONS: pod-archive-onnxruntime-extensions-c-0.13.0.zip
+  RUNTIME_SHA256: 4bd86356e2d5aab1b8ece609bb9caa63161a6d79d21244da007f9fda6830ff3b
+  EXTENSIONS_SHA256: 346522d1171d4c99cb0908fa8e4e9330a4a6aad39cd83ce36eb654437b33e6b5
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download the original archives and verify their pinned checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="https://raw.githubusercontent.com/masicai/onnxruntime-swift-package-manager/$SOURCE_COMMIT/Package.swift"
+          curl --fail --location --retry 3 --output Package.swift "$manifest"
+          grep -F "$RUNTIME_SHA256" Package.swift
+          grep -F "$EXTENSIONS_SHA256" Package.swift
+          gh release download 1.23.1 --repo masicai/onnxruntime-swift-package-manager --pattern "$RUNTIME"
+          gh release download 1.24.2 --repo TypeWhisper/onnxruntime-swift-package-manager --pattern "$EXTENSIONS"
+          printf '%s  %s\n' "$RUNTIME_SHA256" "$RUNTIME" "$EXTENSIONS_SHA256" "$EXTENSIONS" | sha256sum --check --strict
+          for archive in "$RUNTIME" "$EXTENSIONS"; do
+            unzip -tq "$archive"
+            unzip -Z -1 "$archive" | grep -Ei '(^|/)(LICENSE[^/]*|ThirdPartyNotices[^/]*)$'
+          done
+          cat > APPLE-ONNX-SOURCES.md <<'NOTES'
+          # Apple ONNX dependency archives
+
+          These files preserve the exact archives used by VeneraX for iOS and macOS.
+          They were copied and verified on a GitHub-hosted runner, without rebuilding,
+          repacking, changing their checksums, or disabling TLS verification.
+
+          | Archive | Version | Source |
+          | --- | --- | --- |
+          | onnxruntime-libs-1.23.0.zip | ONNX Runtime 1.23.0 | https://github.com/masicai/onnxruntime-swift-package-manager/releases/tag/1.23.1 |
+          | pod-archive-onnxruntime-extensions-c-0.13.0.zip | ONNX Runtime Extensions 0.13.0 | https://github.com/TypeWhisper/onnxruntime-swift-package-manager/releases/tag/1.24.2 |
+
+          The runtime uses the library-format XCFramework from the existing dependency.
+          The extensions archive is required during SwiftPM resolution even though
+          flutter_onnxruntime does not link the extensions product. The mirror release
+          named 1.24.2 supplies only the unchanged extensions 0.13.0 archive here;
+          VeneraX's runtime remains 1.23.0.
+
+          Both checksums come from the already pinned SwiftPM manifest:
+          https://github.com/masicai/onnxruntime-swift-package-manager/blob/57f28b1fdd6fe33585370b146a46c597d6750953/Package.swift
+
+          ```text
+          4bd86356e2d5aab1b8ece609bb9caa63161a6d79d21244da007f9fda6830ff3b  onnxruntime-libs-1.23.0.zip
+          346522d1171d4c99cb0908fa8e4e9330a4a6aad39cd83ce36eb654437b33e6b5  pod-archive-onnxruntime-extensions-c-0.13.0.zip
+          ```
+
+          ONNX Runtime and ONNX Runtime Extensions are MIT licensed. The original
+          LICENSE and third-party notices remain inside the unmodified archives.
+          Preserve those notices when redistributing the files.
+
+          The original extensions URL is
+          https://download.onnxruntime.ai/pod-archive-onnxruntime-extensions-c-0.13.0.zip.
+          On 2026-11-22 it failed TLS hostname validation and the official storage
+          fallback returned HTTP 404. The recovered copy matches the pre-existing
+          upstream checksum. This is a dependency mirror, not a new ONNX release.
+          NOTES
+          cat APPLE-ONNX-SOURCES.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish verified archives without replacing existing assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="repos/$GITHUB_REPOSITORY"
+          id=$(gh api --paginate "$api/releases?per_page=100" --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id")
+          if [[ -z "$id" ]]; then
+            ref=$(gh api "$api/git/matching-refs/tags/$RELEASE_TAG" --jq ".[] | select(.ref == \"refs/tags/$RELEASE_TAG\") | .ref")
+            if [[ -z "$ref" ]]; then
+              gh api --method POST "$api/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" --silent
+            fi
+            test "$(gh api "$api/commits/refs/tags/$RELEASE_TAG" --jq .sha)" = "$GITHUB_SHA"
+            id=$(gh api --method POST "$api/releases" -f tag_name="$RELEASE_TAG" -f name="$RELEASE_TAG" \
+              -f target_commitish="$GITHUB_SHA" -F body=@APPLE-ONNX-SOURCES.md -F draft=true -f make_latest=false --jq .id)
+          fi
+          [[ "$id" =~ ^[0-9]+$ ]]
+          for archive in "$RUNTIME" "$EXTENSIONS" APPLE-ONNX-SOURCES.md; do
+            gh api "$api/releases/$id" > release.json
+            if ! jq -e --arg name "$archive" '.assets | any(.name == $name)' release.json >/dev/null; then
+              jq -e .draft release.json >/dev/null
+              upload_url=$(jq -r '.upload_url | split("{")[0]' release.json)
+              gh api --method POST "$upload_url?name=$archive" -H 'Content-Type: application/octet-stream' --input "$archive" --silent
+            fi
+            digest="sha256:$(sha256sum "$archive" | cut -d" " -f1)"
+            gh api "$api/releases/$id" > release.json
+            jq -e --arg name "$archive" --arg digest "$digest" --argjson size "$(stat -c %s "$archive")" \
+              '.assets | map(select(.name == $name)) | length == 1 and all(.[]; .state == "uploaded" and .digest == $digest and .size == $size)' \
+              release.json >/dev/null
+          done
+          jq -e --rawfile notes APPLE-ONNX-SOURCES.md \
+            '(.assets | length == 3) and (.body | sub("\\n+$"; "")) == ($notes | sub("\\n+$"; ""))' release.json >/dev/null
+          if jq -e .draft release.json >/dev/null; then
+            gh api --method PATCH "$api/releases/$id" -F draft=false -f make_latest=false --silent
+          fi
+          gh api "$api/releases/$id" --jq 'select(.draft == false and .published_at != null) | .html_url'
